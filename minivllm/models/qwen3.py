@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.distributed as dist
 
+from minivllm.layers.attention import Attention
 from minivllm.layers.linear import QKVParallelLinear, RowParallelLinear
 from minivllm.layers.rotary_embedding import get_rope
 
@@ -50,4 +51,10 @@ class Qwen3Attention(nn.Module):
             max_position=max_position,
             base=rope_theta,
             rope_scaling=rope_scaling,
+        )
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            self.num_kv_heads,
         )
