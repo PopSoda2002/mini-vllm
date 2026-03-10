@@ -3,6 +3,8 @@ import torch.distributed as dist
 from multiprocessing.synchronize import Event
 
 from minivllm.config import Config
+from minivllm.models.qwen3 import Qwen3ForCausalLM
+from minivllm.layers.sampler import Sampler
 from minivllm.utils.loader import load_model
 
 class ModelRunner:
@@ -22,3 +24,4 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        self.sampler = Sampler()
