@@ -3,6 +3,7 @@ import torch.distributed as dist
 from multiprocessing.synchronize import Event
 
 from minivllm.config import Config
+from minivllm.engine.sequence import Sequence
 from minivllm.models.qwen3 import Qwen3ForCausalLM
 from minivllm.layers.sampler import Sampler
 from minivllm.utils.loader import load_model
@@ -25,3 +26,13 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        self.warmup_model()
+
+    def warmup_model(self):
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
+        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
+        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        self.run(seqs, True)
+        torch.cuda.empty_cache()
