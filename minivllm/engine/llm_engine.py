@@ -4,6 +4,7 @@ from transformers import AutoTokenizer
 
 from minivllm.config import Config
 from minivllm.engine.model_runner import ModelRunner
+from minivllm.engine.scheduler import Scheduler
 
 class LLMEngine:
     def __init__(self, model, **kwargs):
