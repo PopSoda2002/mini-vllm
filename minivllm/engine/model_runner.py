@@ -1,6 +1,8 @@
+import pickle
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
+from multiprocessing.shared_memory import SharedMemory
 
 from minivllm.config import Config
 from minivllm.engine.sequence import Sequence
@@ -28,8 +30,61 @@ class ModelRunner:
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
+        self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+        torch.set_default_device("cpu")
+        torch.set_default_dtype(default_dtype)
+
+        if self.world_size > 1:
+            if rank == 0:
+                self.shm = SharedMemory(name="minivllm", create=True, size=2**20)
+                dist.barrier()
+            else:
+                dist.barrier()
+                self.shm = SharedMemory(name="minivllm")
+                self.loop()
+
+    def exit(self):
+        if self.world_size > 1:
+            self.shm.close()
+            dist.barrier()
+            if self.rank == 0:
+                self.shm.unlink()
+        if not self.enforce_eager:
+            del self.graphs, self.graph_pool
+        torch.cuda.synchronize()
+        dist.destroy_process_group()
+
+    def loop(self):
+        while True:
+            method_name, args = self.read_shm()
+            self.call(method_name, *args)
+            if method_name == "exit":
+                break
+
+    def read_shm(self):
+        assert self.world_size > 1 and self.rank > 0
+        self.event.wait()
+        n = int.from_bytes(self.shm.buf[0:4], "little")
+        method_name, *args = pickle.loads(self.shm.buf[4:n+4])
+        self.event.clear()
+        return method_name, args
+
+    def write_shm(self, method_name, *args):
+        assert self.world_size > 1 and self.rank == 0
+        data = pickle.dumps([method_name, *args])
+        n = len(data)
+        self.shm.buf[0:4] = n.to_bytes(4, "little")
+        self.shm.buf[4:n+4] = data
+        for event in self.event:
+            event.set()
+
+    def call(self, method_name, *args):
+        if self.world_size > 1 and self.rank == 0:
+            self.write_shm(method_name, *args)
+        method = getattr(self, method_name, None)
+        return method(*args)
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -39,6 +94,26 @@ class ModelRunner:
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
         self.run(seqs, True)
         torch.cuda.empty_cache()
+
+    def allocate_kv_cache(self):
+        config = self.config
+        hf_config = config.hf_config
+        free, total = torch.cuda.mem_get_info()
+        used = total - free
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        num_kv_heads = hf_config.num_key_value_heads
+        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        assert config.num_kvcache_blocks > 0
+        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        layer_id = 0
+        for module in self.model.modules():
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                module.k_cache = self.kv_cache[0, layer_id]
+                module.v_cache = self.kv_cache[1, layer_id]
+                layer_id += 1
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
